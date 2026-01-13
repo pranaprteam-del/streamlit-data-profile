@@ -1,7 +1,7 @@
 python==3.12.*
 streamlit>=1.32.0,<2.0
 pandas>=2.0,<3.0
-ydata-profiling>=4.10.0
-streamlit-ydata-profiling>=0.2.0
+ydata-profiling==4.6.5
+streamlit-ydata-profiling==0.1.3
 openpyxl>=3.0
 wordcloud>=1.9.3  # Explicitly added for robust WordCloud generation
