@@ -1,111 +1,154 @@
 import streamlit as st
 import pandas as pd
-from ydata_profiling import ProfileReport
-from streamlit_ydata_profiling import st_profile_report  # Updated import for modern ydata-profiling
-import os
+from io import BytesIO
+import chardet
 
-# ======================================================
-# Page configuration
-# ======================================================
+# ---------------- Page Config ----------------
 st.set_page_config(
-    page_title="Data Profiler",
+    page_title="Multi-File Preview, Append & Download",
     layout="wide"
 )
 
-# ======================================================
-# Helper functions
-# ======================================================
-def get_filesize_mb(file) -> float:
-    """Return uploaded file size in MB"""
-    return file.size / (1024 ** 2)
+st.title("📂 Multi CSV / Excel Preview, Append & Download")
 
-def validate_file(file):
-    """Allow only CSV and Excel files"""
-    _, ext = os.path.splitext(file.name.lower())
-    if ext in (".csv", ".xlsx"):
-        return ext
-    return None
+# ---------------- File Uploader ----------------
+uploaded_files = st.file_uploader(
+    "Upload CSV or Excel files",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True
+)
 
-# ======================================================
-# Sidebar
-# ======================================================
-with st.sidebar:
-    st.header("📁 Upload Data")
-    uploaded_file = st.file_uploader(
-        "Upload .csv or .xlsx (Max 10 MB)",
-        type=["csv", "xlsx"]
+# ---------------- Helper Functions ----------------
+def read_csv_safely(file):
+    raw = file.read()
+    encoding = chardet.detect(raw)["encoding"]
+
+    return pd.read_csv(
+        BytesIO(raw),
+        encoding=encoding,
+        sep=None,
+        engine="python",
+        on_bad_lines="skip"
     )
-    # Profiling options
-    minimal = True
-    enable_wc = True  # Default: WordClouds enabled
-    if uploaded_file:
-        st.subheader("⚙️ Profiling Options")
-        minimal = st.checkbox(
-            "Generate minimal report (faster)",
-            value=True
+
+def read_excel_safely(file):
+    filename = file.name.lower()
+
+    if filename.endswith(".xls"):
+        try:
+            return pd.read_excel(file, engine="xlrd")
+        except Exception:
+            file.seek(0)
+            tables = pd.read_html(file)
+            return tables[0]
+    else:
+        return pd.read_excel(file, engine="openpyxl")
+
+def fix_headers_if_needed(df):
+    # If column headers are numeric, promote first valid row as header
+    if all(isinstance(col, int) for col in df.columns):
+        header_row_idx = None
+        for i in range(len(df)):
+            if df.iloc[i].notna().sum() > 0:
+                header_row_idx = i
+                break
+
+        if header_row_idx is not None:
+            df.columns = df.iloc[header_row_idx]
+            df = df.iloc[header_row_idx + 1:].reset_index(drop=True)
+
+    # Clean column names
+    df.columns = (
+        df.columns
+        .astype(str)
+        .str.strip()
+        .str.replace("\n", " ", regex=False)
+    )
+
+    return df
+
+def export_to_excel(raw_dfs, combined_df, summary_df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        combined_df.to_excel(writer, index=False, sheet_name="Combined_Data")
+        summary_df.to_excel(writer, index=False, sheet_name="File_Summary")
+
+        for name, df in raw_dfs.items():
+            sheet_name = name[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    return output.getvalue()
+
+# ---------------- Main Logic ----------------
+if uploaded_files:
+    raw_dfs = {}
+    combined_list = []
+
+    st.header("🔍 File Previews (50 rows per file)")
+
+    for file in uploaded_files:
+        try:
+            # -------- Read full file --------
+            if file.name.lower().endswith(".csv"):
+                df = read_csv_safely(file)
+            else:
+                df = read_excel_safely(file)
+
+            # -------- Fix headers if needed --------
+            df = fix_headers_if_needed(df)
+
+            # -------- Add metadata --------
+            df["source_file"] = file.name
+
+            # -------- Store FULL data --------
+            raw_dfs[file.name] = df
+            combined_list.append(df)
+
+            # -------- Preview ONLY --------
+            with st.expander(f"📄 {file.name}"):
+                st.dataframe(df.head(50), use_container_width=True)
+                st.caption(f"Rows: {df.shape[0]} | Columns: {df.shape[1]}")
+
+        except Exception as e:
+            st.error(f"❌ Failed to read {file.name}: {e}")
+
+    if combined_list:
+        # -------- Append FULL data --------
+        combined_df = pd.concat(combined_list, ignore_index=True)
+
+        # -------- Summary --------
+        summary_df = (
+            combined_df.groupby("source_file")
+            .size()
+            .reset_index(name="Row_Count")
         )
-        enable_wc = st.checkbox(
-            "Enable WordClouds (for text columns)",
-            value=True
+
+        st.header("📊 Combined Preview (first 100 rows only)")
+        st.dataframe(combined_df.head(100), use_container_width=True)
+        st.caption(
+            f"Total Rows: {combined_df.shape[0]} | "
+            f"Total Columns: {combined_df.shape[1]}"
         )
 
-# ======================================================
-# Main App Logic
-# ======================================================
-if uploaded_file:
-    # ---------- Validate file ----------
-    ext = validate_file(uploaded_file)
-    if not ext:
-        st.error("❌ Only .csv and .xlsx files are supported.")
-        st.stop()
+        # -------- Download FULL data --------
+        excel_data = export_to_excel(raw_dfs, combined_df, summary_df)
 
-    # ---------- Validate file size ----------
-    filesize = get_filesize_mb(uploaded_file)
-    if filesize > 10:
-        st.error(
-            f"❌ Maximum allowed size is 10 MB. "
-            f"Uploaded file is {filesize:.2f} MB."
+        st.subheader("💾 Save As")
+
+        custom_filename = st.text_input(
+            "Enter file name",
+            value="combined_output.xlsx"
         )
-        st.stop()
 
-    # ---------- Load data ----------
-    try:
-        if ext == ".csv":
-            df = pd.read_csv(uploaded_file)
-        else:
-            excel_file = pd.ExcelFile(uploaded_file)
-            sheet_name = st.sidebar.selectbox(
-                "Select Excel sheet",
-                excel_file.sheet_names
-            )
-            df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-    except Exception as e:
-        st.error(f"❌ Error reading file: {e}")
-        st.stop()
+        if not custom_filename.lower().endswith(".xlsx"):
+            custom_filename += ".xlsx"
 
-    # ---------- Preview ----------
-    st.subheader("🔍 Data Preview")
-    st.write(f"**Shape:** {df.shape[0]} rows × {df.shape[1]} columns")
-    st.dataframe(df.head())
-
-    # ---------- Profiling ----------
-    st.subheader("📊 Data Profiling Report")
-    with st.spinner("Generating profiling report..."):
-        profile = ProfileReport(
-            df,
-            minimal=minimal,
-            explorative=True,
-            pool_size=1,  # Safer for Streamlit
-            correlations=None,  # Avoids heavy calculations
-            html={"style": {"full_width": True}},
-            plot={"wordcloud": enable_wc}  # Enable/disable WordClouds based on user choice
+        st.download_button(
+            label="⬇️ Download Combined Excel (FULL DATA)",
+            data=excel_data,
+            file_name=custom_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-    # Render report in Streamlit
-    st_profile_report(profile)
 
 else:
-    st.title("📊 Data Profiler App")
-    st.info(
-        "Upload a CSV or Excel file from the sidebar to generate "
-        "an automated data profiling report."
-    )
+    st.info("Upload one or more CSV / Excel files to begin.")
